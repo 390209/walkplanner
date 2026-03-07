@@ -603,34 +603,89 @@ let voiceState = 'command';
 let pendingAdvanceAfterAdd = false;
 
 // ══════════════════════════════════════════════════════
-//  OAUTH (PKCE implicit → token via hash)
+//  OAUTH — PKCE Authorization Code Flow
 // ══════════════════════════════════════════════════════
-function startLogin() {
+
+// Genera un string aleatorio para code_verifier
+function randomString(len) {
+  const arr = new Uint8Array(len);
+  crypto.getRandomValues(arr);
+  return btoa(String.fromCharCode(...arr)).replace(/\+/g,'-').replace(/\//g,'_').replace(/=/g,'');
+}
+
+// SHA-256 del code_verifier → code_challenge
+async function sha256base64url(plain) {
+  const encoder = new TextEncoder();
+  const data = encoder.encode(plain);
+  const hash = await crypto.subtle.digest('SHA-256', data);
+  return btoa(String.fromCharCode(...new Uint8Array(hash)))
+    .replace(/\+/g,'-').replace(/\//g,'_').replace(/=/g,'');
+}
+
+async function startLogin() {
   const clientId = document.getElementById('client-id-input').value.trim();
   const tenantId = document.getElementById('tenant-id-input').value.trim() || 'consumers';
   if (!clientId) { showToast('⚠️ Ingresá tu Client ID'); return; }
   cfg = { clientId, tenantId };
   localStorage.setItem('wp_cfg', JSON.stringify(cfg));
-  const redirectUri = encodeURIComponent(location.href.split('#')[0].split('?')[0]);
-  // 'consumers' fuerza login solo con cuentas personales Microsoft (Outlook/Hotmail)
-  // evita que se mezcle con tenants corporativos asociados a la cuenta
+
+  // PKCE
+  const verifier = randomString(64);
+  const challenge = await sha256base64url(verifier);
+  sessionStorage.setItem('pkce_verifier', verifier);
+
+  const redirectUri = location.href.split('#')[0].split('?')[0];
   const effectiveTenant = (tenantId === 'common') ? 'consumers' : tenantId;
+
   const url = `https://login.microsoftonline.com/${effectiveTenant}/oauth2/v2.0/authorize`
-    + `?client_id=${clientId}`
-    + `&response_type=token`
-    + `&redirect_uri=${redirectUri}`
-    + `&scope=${encodeURIComponent(SCOPES)}`
-    + `&response_mode=fragment`
+    + `?client_id=${encodeURIComponent(clientId)}`
+    + `&response_type=code`
+    + `&redirect_uri=${encodeURIComponent(redirectUri)}`
+    + `&scope=${encodeURIComponent(SCOPES + ' offline_access')}`
+    + `&code_challenge=${challenge}`
+    + `&code_challenge_method=S256`
+    + `&response_mode=query`
     + `&state=walkplanner`;
   location.href = url;
 }
 
-function parseHash() {
-  const hash = location.hash.substring(1);
+// Intercambia el code por un access_token
+async function exchangeCode(code) {
+  const verifier = sessionStorage.getItem('pkce_verifier');
+  const redirectUri = location.href.split('?')[0].split('#')[0];
+  const effectiveTenant = (cfg.tenantId === 'common') ? 'consumers' : cfg.tenantId;
+
+  const body = new URLSearchParams({
+    client_id: cfg.clientId,
+    grant_type: 'authorization_code',
+    code,
+    redirect_uri: redirectUri,
+    code_verifier: verifier,
+    scope: SCOPES + ' offline_access'
+  });
+
+  const res = await fetch(`https://login.microsoftonline.com/${effectiveTenant}/oauth2/v2.0/token`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: body.toString()
+  });
+  const data = await res.json();
+  if (data.access_token) {
+    accessToken = data.access_token;
+    // Guardar refresh token si viene
+    if (data.refresh_token) sessionStorage.setItem('refresh_token', data.refresh_token);
+    sessionStorage.removeItem('pkce_verifier');
+    return true;
+  }
+  console.error('Token error:', data);
+  return false;
+}
+
+function parseQuery() {
   const params = {};
-  hash.split('&').forEach(p => {
+  location.search.substring(1).split('&').forEach(p => {
     const [k, v] = p.split('=');
-    params[k] = decodeURIComponent(v || '');
+    if (k) params[k] = decodeURIComponent(v || '');
   });
   return params;
 }
@@ -640,14 +695,26 @@ async function init() {
   if (saved) {
     cfg = JSON.parse(saved);
     document.getElementById('client-id-input').value = cfg.clientId || '';
-    document.getElementById('tenant-id-input').value = cfg.tenantId || 'common';
+    document.getElementById('tenant-id-input').value = cfg.tenantId || 'consumers';
   }
 
-  const params = parseHash();
-  if (params.access_token) {
-    accessToken = params.access_token;
+  // Recibimos el código de autorización en la URL
+  const params = parseQuery();
+  if (params.code && params.state === 'walkplanner') {
     history.replaceState(null, '', location.pathname);
-    await loadApp();
+    showLoading('Autenticando...');
+    const ok = await exchangeCode(params.code);
+    if (ok) {
+      await loadApp();
+    } else {
+      hideLoading();
+      showToast('❌ Error de autenticación. Intentá de nuevo.');
+    }
+    return;
+  }
+  if (params.error) {
+    showToast('❌ ' + decodeURIComponent(params.error_description || params.error));
+    history.replaceState(null, '', location.pathname);
   }
 }
 
